@@ -17,6 +17,32 @@
 #include <QDialogButtonBox>
 #include <QDialog>
 #include <QTimer>
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QTextStream>
+
+static bool eventMatchesShortcut(QKeyEvent* event, const QString& shortcutText)
+{
+    const QKeySequence sequence(shortcutText);
+    if (sequence.isEmpty()) {
+        return false;
+    }
+    const int pressed = event->key() | static_cast<int>(event->modifiers());
+    return sequence.matches(QKeySequence(pressed)) == QKeySequence::ExactMatch;
+}
+
+#ifdef Q_OS_WIN
+static void closeHiddenIconsPopup()
+{
+    HWND overflowWindow = FindWindowW(L"NotifyIconOverflowWindow", nullptr);
+    if (overflowWindow) {
+        PostMessageW(overflowWindow, WM_CLOSE, 0, 0);
+        ShowWindow(overflowWindow, SW_HIDE);
+    }
+}
+#endif
 
 // Implementation of GlobalHotkeyFilter
 #ifdef Q_OS_WIN
@@ -117,12 +143,17 @@ PreviewWindow::PreviewWindow(QWidget *parent) : QLabel(parent)
     setAlignment(Qt::AlignCenter);
     setWindowTitle("Screenshot Preview");
     setFocusPolicy(Qt::StrongFocus); // Needed to receive key events
+    m_saveShortcut = "Ctrl+S";
+}
+
+void PreviewWindow::setSaveShortcut(const QString& shortcutText)
+{
+    m_saveShortcut = shortcutText;
 }
 
 void PreviewWindow::keyPressEvent(QKeyEvent *event)
 {
-    // Ctrl+S to save
-    if (event->key() == Qt::Key_S && event->modifiers() == Qt::ControlModifier) {
+    if (eventMatchesShortcut(event, m_saveShortcut)) {
         emit saveRequested();
         event->accept();
     }
@@ -147,6 +178,15 @@ ScreenshotTool::ScreenshotTool(QWidget *parent)
       settings("ManishTirkey", "CatchAndHold"),
       hotkeyFilter(nullptr),
       autoStartEnabled(false),
+      autoStartAction(nullptr),
+      printScreenShortcut(nullptr),
+      captureClipboardShortcut("Print"),
+      captureSaveShortcut("Ctrl+Print"),
+      capturePreviewShortcut("Shift+Print"),
+      cancelCaptureShortcut("Esc"),
+      previewSaveShortcut("Ctrl+S"),
+      captureOverlaySaveShortcut("S"),
+      lastCaptureRequestMs(0),
       currentCaptureMode(ClipboardOnly)
 {
     // Set window properties for full-screen overlay
@@ -163,19 +203,19 @@ ScreenshotTool::ScreenshotTool(QWidget *parent)
     // connect(previewWindow, &PreviewWindow::copyToClipboardRequested,
     //         this, &ScreenshotTool::copyToClipboard);
 
+    // Load persisted config first so UI reflects values.
+    loadSettings();
+    previewWindow->setSaveShortcut(previewSaveShortcut);
+
     // Setup tray icon and shortcuts
     setupTrayIcon();
     setupShortcuts();
-
-    // Load settings
-    loadSettings();
 
     // Setup global hotkey filter
     hotkeyFilter = new GlobalHotkeyFilter(this, "startCapture");
     QGuiApplication::instance()->installNativeEventFilter(hotkeyFilter);
 
-    // Load auto-start setting
-    autoStartEnabled = settings.value("AutoStart", false).toBool();
+    // Apply startup preference loaded from config.
     setAutoStart(autoStartEnabled);
 
     // Initialize cursor tracker
@@ -220,20 +260,19 @@ void ScreenshotTool::setupTrayIcon()
 
     // Add actions to the menu
     QAction* captureAction = new QAction("Capture Screenshot", this);
-    captureAction->setShortcut(QKeySequence(Qt::Key_Print)); // Set Print Screen as shortcut
     captureAction->setShortcutContext(Qt::ApplicationShortcut);
-    connect(captureAction, &QAction::triggered, this, &ScreenshotTool::startCapture);
+    connect(captureAction, &QAction::triggered, this, &ScreenshotTool::startCaptureFromTray);
 
     QAction* shortcutsAction = new QAction("Keyboard Shortcuts", this);
     connect(shortcutsAction, &QAction::triggered, this, &ScreenshotTool::showShortcutsDialog);
 
-    QAction* settingsAction = new QAction("Settings", this);
-    connect(settingsAction, &QAction::triggered, this, &ScreenshotTool::showSettingsDialog);
+    QAction* changeConfigAction = new QAction("Change Config", this);
+    connect(changeConfigAction, &QAction::triggered, this, &ScreenshotTool::openConfigFile);
 
     QAction* aboutAction = new QAction("About", this);
     connect(aboutAction, &QAction::triggered, this, &ScreenshotTool::showAboutDialog);
 
-    QAction* autoStartAction = new QAction("Start with Windows", this);
+    autoStartAction = new QAction("Start with Windows", this);
     autoStartAction->setCheckable(true);
     autoStartAction->setChecked(isAutoStartEnabled());
     connect(autoStartAction, &QAction::triggered, this, [this](bool checked) {
@@ -247,7 +286,7 @@ void ScreenshotTool::setupTrayIcon()
     trayMenu->addAction(captureAction);
     trayMenu->addSeparator();
     trayMenu->addAction(shortcutsAction);
-    trayMenu->addAction(settingsAction);
+    trayMenu->addAction(changeConfigAction);
     trayMenu->addAction(aboutAction);
     trayMenu->addSeparator();
     trayMenu->addAction(autoStartAction);
@@ -269,12 +308,30 @@ void ScreenshotTool::setupTrayIcon()
     // Connect tray icon activation signal
     connect(trayIcon, &QSystemTrayIcon::activated, [this](QSystemTrayIcon::ActivationReason reason) {
         if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick) {
-            startCapture();
+            startCaptureFromTray();
         }
     });
 
+    captureAction->setShortcut(QKeySequence(captureClipboardShortcut));
+
     // Add the capture action to the application to enable the shortcut
     this->addAction(captureAction);
+}
+
+void ScreenshotTool::startCaptureFromTray()
+{
+    if (trayMenu) {
+        trayMenu->hide();
+    }
+
+#ifdef Q_OS_WIN
+    closeHiddenIconsPopup();
+#endif
+
+    // Let Windows dismiss tray popups before screen grab starts.
+    QTimer::singleShot(320, this, [this]() {
+        startCapture();
+    });
 }
 
 void ScreenshotTool::setupShortcuts()
@@ -283,20 +340,76 @@ void ScreenshotTool::setupShortcuts()
     // so this method can be simplified
 
     // We'll keep the QShortcut for when the app has focus, as a backup
-    QShortcut* printScreenShortcut = new QShortcut(QKeySequence(Qt::Key_Print), this);
+    if (printScreenShortcut) {
+        delete printScreenShortcut;
+        printScreenShortcut = nullptr;
+    }
+
+    printScreenShortcut = new QShortcut(QKeySequence(captureClipboardShortcut), this);
     connect(printScreenShortcut, &QShortcut::activated, this, &ScreenshotTool::startCapture);
 }
 
 void ScreenshotTool::loadSettings()
 {
-    // Load any saved settings
-    // For example, you could load custom hotkey settings here
+    const QString configPath = getConfigFilePath();
+    QFile file(configPath);
+
+    // Backward-compatible default.
+    autoStartEnabled = settings.value("AutoStart", false).toBool();
+
+    if (!file.exists()) {
+        saveSettings();
+        return;
+    }
+
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+
+    const QByteArray data = file.readAll();
+    file.close();
+
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        return;
+    }
+
+    const QJsonObject root = doc.object();
+    if (root.contains("start_with_windows")) {
+        autoStartEnabled = root.value("start_with_windows").toBool(autoStartEnabled);
+    }
 }
 
 void ScreenshotTool::saveSettings()
 {
-    // Save current settings
-    // For example, you could save custom hotkey settings here
+    const QString configPath = getConfigFilePath();
+    QFileInfo configInfo(configPath);
+    QDir().mkpath(configInfo.absolutePath());
+
+    QJsonObject root;
+    root.insert("start_with_windows", autoStartEnabled);
+
+    QFile file(configPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return;
+    }
+
+    const QJsonDocument doc(root);
+    file.write(doc.toJson(QJsonDocument::Indented));
+    file.close();
+}
+
+QString ScreenshotTool::getConfigFilePath() const
+{
+    return QCoreApplication::applicationDirPath() + "/config.json";
+}
+
+void ScreenshotTool::openConfigFile()
+{
+    // Ensure file exists with current values, then open for manual edits.
+    saveSettings();
+    QDesktopServices::openUrl(QUrl::fromLocalFile(getConfigFilePath()));
 }
 
 void ScreenshotTool::startCapture()
@@ -319,6 +432,13 @@ void ScreenshotTool::startCaptureAndPreview()
 
 void ScreenshotTool::performCapture()
 {
+    // Ignore rapid duplicate triggers (e.g. global hotkey + local shortcut).
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (isCapturing || (nowMs - lastCaptureRequestMs) < 300) {
+        return;
+    }
+    lastCaptureRequestMs = nowMs;
+
     // Capture the entire screen
     captureFullScreen();
 
@@ -333,8 +453,11 @@ void ScreenshotTool::performCapture()
     // Map global cursor position to widget coordinates
     currentMousePos = mapFromGlobal(QCursor::pos());
 
-    // Show the tool fullscreen
-    showFullScreen();
+    // Cover the full virtual desktop so multi-monitor selection works.
+    setGeometry(virtualDesktopGeometry);
+    show();
+    raise();
+    activateWindow();
     setCursor(Qt::CrossCursor);
 
     // Start tracking cursor
@@ -373,12 +496,31 @@ void ScreenshotTool::handleCaptureCompletion()
 
 void ScreenshotTool::captureFullScreen()
 {
-    // Get primary screen
-    QScreen *screen = QGuiApplication::primaryScreen();
-    if (!screen) return;
+    const QList<QScreen*> screens = QGuiApplication::screens();
+    if (screens.isEmpty()) {
+        fullScreenPixmap = QPixmap();
+        virtualDesktopGeometry = QRect();
+        return;
+    }
 
-    // Capture the entire screen
-    fullScreenPixmap = screen->grabWindow(0);
+    QRect desktopBounds = screens.first()->geometry();
+    for (QScreen* screen : screens) {
+        desktopBounds = desktopBounds.united(screen->geometry());
+    }
+    virtualDesktopGeometry = desktopBounds;
+
+    QPixmap stitched(desktopBounds.size());
+    stitched.fill(Qt::black);
+
+    QPainter painter(&stitched);
+    for (QScreen* screen : screens) {
+        const QPixmap shot = screen->grabWindow(0);
+        const QPoint targetPos = screen->geometry().topLeft() - desktopBounds.topLeft();
+        painter.drawPixmap(targetPos, shot);
+    }
+    painter.end();
+
+    fullScreenPixmap = stitched;
 }
 
 void ScreenshotTool::paintEvent(QPaintEvent *event)
@@ -648,12 +790,10 @@ void ScreenshotTool::copyToClipboard()
 
 void ScreenshotTool::keyPressEvent(QKeyEvent *event)
 {
-    // ESC key to cancel
-    if (event->key() == Qt::Key_Escape) {
+    if (eventMatchesShortcut(event, cancelCaptureShortcut)) {
         close();
     }
-    // S key to save
-    else if (event->key() == Qt::Key_S && hasCapture) {
+    else if (hasCapture && eventMatchesShortcut(event, captureOverlaySaveShortcut)) {
         saveScreenshot();
     }
 }
@@ -684,13 +824,15 @@ void ScreenshotTool::showShortcutsDialog()
 {
     QMessageBox::information(nullptr, "Keyboard Shortcuts",
                              "Global Shortcuts:\n"
-                             "- Print Screen: Capture screenshot and copy to clipboard\n"
-                             "- Ctrl + Print Screen: Capture, copy to clipboard, and save file\n"
-                             "- Shift + Print Screen: Capture, copy to clipboard, and show preview\n\n"
+                             "- " + captureClipboardShortcut + ": Capture screenshot and copy to clipboard\n"
+                             "- " + captureSaveShortcut + ": Capture, copy to clipboard, and save file\n"
+                             "- " + capturePreviewShortcut + ": Capture, copy to clipboard, and show preview\n\n"
                              "During Capture:\n"
-                             "- ESC: Cancel capture\n\n"
+                             "- " + cancelCaptureShortcut + ": Cancel capture\n"
+                             "- " + captureOverlaySaveShortcut + ": Save screenshot (after capture)\n\n"
                              "In Preview Window:\n"
-                             "- Ctrl+S: Save screenshot");
+                             "- " + previewSaveShortcut + ": Save screenshot\n\n"
+                             "Config currently stores only start_with_windows.");
 }
 
 
@@ -706,38 +848,6 @@ void ScreenshotTool::showAboutDialog()
         "- Global hotkey support");
 }
 
-void ScreenshotTool::showSettingsDialog()
-{
-    QDialog* dialog = new QDialog(this);
-    dialog->setWindowTitle("Settings");
-
-    QVBoxLayout* layout = new QVBoxLayout(dialog);
-
-    // Auto-start checkbox
-    QCheckBox* autoStartCheck = new QCheckBox("Start with Windows", dialog);
-    autoStartCheck->setChecked(isAutoStartEnabled());
-    layout->addWidget(autoStartCheck);
-
-    // Add other settings here...
-
-    // Buttons
-    QDialogButtonBox* buttons = new QDialogButtonBox(
-        QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
-        Qt::Horizontal,
-        dialog
-    );
-    layout->addWidget(buttons);
-
-    connect(buttons, &QDialogButtonBox::accepted, dialog, &QDialog::accept);
-    connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
-
-    if (dialog->exec() == QDialog::Accepted) {
-        setAutoStart(autoStartCheck->isChecked());
-        // Save other settings...
-    }
-
-    delete dialog;
-}
 
 void ScreenshotTool::quitApplication()
 {
@@ -760,8 +870,6 @@ void ScreenshotTool::closeEvent(QCloseEvent *event)
 
 void ScreenshotTool::setAutoStart(bool enable)
 {
-    if (enable == autoStartEnabled) return;
-
     #ifdef Q_OS_WIN
         QSettings bootUpSettings("HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
                                QSettings::NativeFormat);
@@ -789,6 +897,13 @@ void ScreenshotTool::setAutoStart(bool enable)
 
     autoStartEnabled = enable;
     settings.setValue("AutoStart", enable);
+    saveSettings();
+
+    if (autoStartAction) {
+        const bool previousState = autoStartAction->blockSignals(true);
+        autoStartAction->setChecked(enable);
+        autoStartAction->blockSignals(previousState);
+    }
 
     // Use qDebug instead of LOG_INFO until Logger is properly set up
     qDebug() << "Auto-start" << (enable ? "enabled" : "disabled");

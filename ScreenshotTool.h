@@ -20,6 +20,7 @@
 #include <QSettings>
 #include <QAbstractNativeEventFilter>
 #include <QTimer>
+#include <QtGlobal>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -28,6 +29,7 @@
 class QCheckBox;
 class QVBoxLayout;
 class QDialogButtonBox;
+class QShortcut;
 
 // Native event filter for global hotkeys
 class GlobalHotkeyFilter : public QAbstractNativeEventFilter
@@ -62,6 +64,7 @@ class PreviewWindow : public QLabel
 
 public:
     PreviewWindow(QWidget *parent = nullptr);
+    void setSaveShortcut(const QString& shortcutText);
 
 signals:
     void saveRequested();
@@ -69,6 +72,9 @@ signals:
 
 protected:
     void keyPressEvent(QKeyEvent *event) override;
+
+private:
+    QString m_saveShortcut;
 };
 
 class ScreenshotTool : public QWidget
@@ -88,8 +94,9 @@ public slots:
     void copyToClipboard();
     void showShortcutsDialog();
     void showAboutDialog();
-    void showSettingsDialog();
+    void openConfigFile();
     void quitApplication();
+    void startCaptureFromTray();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -103,6 +110,7 @@ private:
     QPoint startPos;
     QPoint endPos;
     QPoint currentMousePos;
+    QRect virtualDesktopGeometry;
     QPixmap fullScreenPixmap;
     QPixmap capturedPixmap;
     bool isCapturing;
@@ -114,6 +122,15 @@ private:
     GlobalHotkeyFilter* hotkeyFilter;
     bool autoStartEnabled;
     QTimer* cursorTracker;
+    QAction* autoStartAction;
+    QShortcut* printScreenShortcut;
+    QString captureClipboardShortcut;
+    QString captureSaveShortcut;
+    QString capturePreviewShortcut;
+    QString cancelCaptureShortcut;
+    QString previewSaveShortcut;
+    QString captureOverlaySaveShortcut;
+    qint64 lastCaptureRequestMs;
 
     // Capture modes
     enum CaptureMode {
@@ -130,6 +147,7 @@ private:
     void setupShortcuts();
     void loadSettings();
     void saveSettings();
+    QString getConfigFilePath() const;
     void setAutoStart(bool enable);
     bool isAutoStartEnabled() const;
     QString getApplicationPath() const;

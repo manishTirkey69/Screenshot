@@ -1,5 +1,5 @@
-#define MyAppName "Catch and Hold"
-#define MyAppVersion "1.0"
+#define MyAppName "Screenshot"
+#define MyAppVersion "3.1.0"
 #define MyAppPublisher "ManishTirkey"
 #define MyAppURL "https://www.manishtirkey.com"
 #define MyAppExeName "ScreenshotTool.exe"
@@ -56,3 +56,12 @@ begin
     // Add any post-installation tasks here
   end;
 end; 
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+  begin
+    // Ensure Start with Windows entry is removed even if user enabled it later from app settings.
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'CatchAndHold');
+  end;
+end;
