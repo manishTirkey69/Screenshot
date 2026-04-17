@@ -1,3 +1,5 @@
+![Project Screenshot](./Screenshots/1.png)
+![Project Screenshot](./Screenshots/2.png)
 ## 📷 [QT](https://www.qt.io/) Based ScreenShot Application
 
 ### Features of Application
